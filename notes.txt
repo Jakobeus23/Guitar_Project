@@ -1,0 +1,37 @@
+make sure it uses gpu. 
+address convolution (i dont like the idea), 
+make sure stft length is ideal, 
+increase log bins to double, 
+ensure this can predict multiple notes in sequence.
+cross validation bc low amt of data?
+need 100 percent accuracy before moving on, this is the easiest prediction. 
+Use a Multi-Scale Approach
+heavily pools (coarse but captures broad features), another that  never pools frequency, The outputs are then combined before the RNN.
+
+force top 1 predictions?
+
+silence30.wav,silence
+silence31.wav,silence
+silence32.wav,silence
+silence33.wav,silence
+silence34.wav,silence
+silence35.wav,silence
+silence36.wav,silence
+silence37.wav,silence
+silence38.wav,silence
+silence39.wav,silence
+silence40.wav,silence
+silence41.wav,silence
+silence42.wav,silence
+silence43.wav,silence
+silence44.wav,silence
+silence45.wav,silence
+silence46.wav,silence
+silence47.wav,silence
+silence48.wav,silence
+silence49.wav,silence
+silence50.wav,silence
+silence51.wav,silence
+silence52.wav,silence
+silence53.wav,silence
+silence54.wav,silence
