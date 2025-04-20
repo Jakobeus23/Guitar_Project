@@ -238,7 +238,11 @@ for i, (true_vec, prob_vec) in enumerate(zip(y_test, y_prob)):
     print(f"  Probs: {prob_rounded}\n")
 
 
-y_pred = (y_prob >= THR).astype(int)
+# Always predict the class with the highest probability
+y_pred = np.zeros_like(y_prob)
+top1 = np.argmax(y_prob, axis=1)
+y_pred[np.arange(len(y_prob)), top1] = 1
+
 
 # 2) utility: map index ↔ label
 idx_to_label = {i: lbl for lbl, i in label_to_idx.items()}
