@@ -1,278 +1,365 @@
 import os
+import math
 import numpy as np
 import pandas as pd
 import soundfile as sf
 import librosa
 import tensorflow as tf
+from sklearn.model_selection import train_test_split
 from tensorflow.keras import layers, models
+from tensorflow.keras.layers import Input, Masking, GRU, TimeDistributed, Dense
+from tensorflow.keras.models import Model
+from matplotlib import pyplot as plt
+
+os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # FOR out_of_range error default w/ batches || 0 = all logs, 1 = warnings, 2 = errors only, 3 = fatal errors
 
 ###################################
-# Configuration / Hyperparams
+# Configuration / Hyper‑params
 ###################################
-LABEL_CSV = "labels.csv"
-DATA_FOLDER = "Guitar_Data"
+LABEL_CSV  = "labels.csv"
+DATA_DIR   = "Guitar_Data"
 
-FFT_SIZE = 2048
+FFT_SIZE   = 2048
 HOP_LENGTH = 512
-SAMPLE_RATE = 22050  # downsample for efficiency if needed
-MIN_FREQ = 30.0
-MAX_FREQ = SAMPLE_RATE / 2.0
+SAMPLE_RATE= 44100
+MIN_FREQ   = 30.0
+MAX_FREQ   = SAMPLE_RATE / 2
 N_LOG_BINS = 512
 
 TEST_SPLIT = 0.2
 BATCH_SIZE = 8
-EPOCHS = 10
-RNN_UNITS = 64
+EPOCHS      = 35
+RNN_UNITS   = 64
 LEARNING_RATE = 1e-3
-
-DROPOUT_RATE = 0.1
+DROPOUT     = 0.1
 
 ###################################
-# 1. Load the CSV and Identify Labels
+# 1. Read label file
 ###################################
 df = pd.read_csv(LABEL_CSV)
 unique_labels = sorted(df["label"].unique())
-num_classes = len(unique_labels)
-label_to_idx = {lbl: i for i, lbl in enumerate(unique_labels)}
-
+num_classes   = len(unique_labels)
+label_to_idx  = {lbl:i for i,lbl in enumerate(unique_labels)}
+idx_to_label  = {i:lbl for lbl,i in label_to_idx.items()}
 print("Unique labels:", unique_labels)
 
 ###################################
-# 2. Function to compute log-frequency STFT
+# 2. Spectrogram helper
 ###################################
-def compute_log_spectrogram(audio, sr):
-    """
-    1) Pad short audio if needed
-    2) STFT -> amplitude_to_db
-    3) Map freq bins to log scale
-    Returns shape (N_LOG_BINS, time_frames).
-    """
-    # If audio < FFT_SIZE, pad
-    if len(audio) < FFT_SIZE:
-        pad_len = FFT_SIZE - len(audio)
-        audio = np.pad(audio, (0, pad_len))
 
-    stft = librosa.stft(audio, n_fft=FFT_SIZE, hop_length=HOP_LENGTH)
-    mag = np.abs(stft)
-    mag_db = librosa.amplitude_to_db(mag, ref=np.max)
-
+def compute_log_spectrogram(y, sr):
+    S = np.abs(librosa.stft(y, n_fft=FFT_SIZE, hop_length=HOP_LENGTH))
+    S_db = librosa.amplitude_to_db(S, ref=np.max)
     freqs = librosa.fft_frequencies(sr=sr, n_fft=FFT_SIZE)
-    log_freqs = np.logspace(np.log10(MIN_FREQ), np.log10(MAX_FREQ), num=N_LOG_BINS)
+    log_bins = np.logspace(np.log10(MIN_FREQ), np.log10(MAX_FREQ), N_LOG_BINS)
+    out = np.zeros((S_db.shape[1], N_LOG_BINS), dtype=np.float32)
+    for k,f in enumerate(log_bins):
+        idx = np.argmin(np.abs(freqs-f))
+        out[:,k] = S_db[idx]
+    # row‑wise z‑score (time axis) – stabilises gradients
+    out = (out - out.mean(axis=1, keepdims=True)) / (out.std(axis=1, keepdims=True) + 1e-6)
+    return out
 
-    time_frames = mag_db.shape[1]
-    log_spectrogram = np.zeros((N_LOG_BINS, time_frames), dtype=np.float32)
-
-    for i, lf in enumerate(log_freqs):
-        idx = np.argmin(np.abs(freqs - lf))
-        row = mag_db[idx, :].ravel()  # ensure shape (time_frames,)
-        log_spectrogram[i, :] = row
-
-    return log_spectrogram
 
 ###################################
-# 3. Load/Preprocess Audio, Pad Spectrograms
+# 3. tf.data loaders
 ###################################
-X_spectrograms = []
-y_labels = []
-max_time_frames = 0
 
-for _, row in df.iterrows():
-    wav_file = row["filename"]
-    label_str = row["label"]
+def load_and_process(fname, label_vec):
+    """
+    Returns 3 things:
+      spec         Float32 tensor, shape (T, N_LOG_BINS)
+      frame_labels Float32 tensor, shape (T, num_classes)
+      weights      Float32 tensor, shape (T,)
+    """
+    def _py_load(path_bytes, label_np):
+        path = os.path.join(DATA_DIR, path_bytes.decode())
+        y, sr = sf.read(path)
 
-    wav_path = os.path.join(DATA_FOLDER, wav_file)
-    if not os.path.isfile(wav_path):
-        print(f"Warning: {wav_path} not found, skipping.")
-        continue
+        # stereo → mono
+        if y.ndim == 2:
+            if y.shape[1] == 1:
+                y = y[:,0]
+            else:
+                ch0, ch1 = y[:,0], y[:,1]
+                y = ch0 if np.sum(np.abs(ch0))>np.sum(np.abs(ch1)) else ch1
 
-    # Load and downsample
-    audio, sr = sf.read(wav_path)
-    if sr != SAMPLE_RATE:
-        audio = librosa.resample(audio, orig_sr=sr, target_sr=SAMPLE_RATE)
-        sr = SAMPLE_RATE
+        # compute spec
+        spec = compute_log_spectrogram(y, sr).astype(np.float32)  # (T, bins)
+        T    = spec.shape[0]
 
-    # Build multi-label vector (currently single label -> 1.0)
-    label_vec = np.zeros(num_classes, dtype=np.float32)
-    label_index = label_to_idx[label_str]
-    label_vec[label_index] = 1.0
+        # repeat the one‑hot per frame
+        frame_labels = np.repeat(label_np[None, :], T, axis=0).astype(np.float32)
+        # weight=1 for real, we'll pad weights later to 0
+        weights = np.ones((T,), dtype=np.float32)
 
-    # Compute log-spectrogram
-    log_spec = compute_log_spectrogram(audio, sr)  # (N_LOG_BINS, time_frames)
-    cur_frames = log_spec.shape[1]
-    if cur_frames > max_time_frames:
-        max_time_frames = cur_frames
+        return spec, frame_labels, weights
 
-    X_spectrograms.append(log_spec)
-    y_labels.append(label_vec)
+    spec, frame_labels, weights = tf.numpy_function(
+        _py_load,
+        [fname, label_vec],
+        [tf.float32, tf.float32, tf.float32]
+    )
+    spec.set_shape([None, N_LOG_BINS])
+    frame_labels.set_shape([None, num_classes])
+    weights.set_shape([None])
+    return spec, frame_labels, weights
 
-print("Total samples loaded:", len(X_spectrograms))
-print("Max time frames:", max_time_frames)
 
-# Pad all to max_time_frames
-num_samples = len(X_spectrograms)
-X_data = np.zeros((num_samples, N_LOG_BINS, max_time_frames, 1), dtype=np.float32)
-y_data = np.array(y_labels, dtype=np.float32)
 
-for i, spec in enumerate(X_spectrograms):
-    t_frames = spec.shape[1]
-    X_data[i, :, :t_frames, 0] = spec  # zero-pad the remainder
 
-print("X_data shape:", X_data.shape)
-print("y_data shape:", y_data.shape)
+
+# split file paths / labels
+paths = df["filename"].tolist()
+labels_idx = df["label"].map(label_to_idx).tolist()
+train_p, val_p, train_l, val_l = train_test_split(paths, labels_idx, test_size=TEST_SPLIT,
+                                                 stratify=labels_idx, random_state=42)
+
+# assume you’ve already split:
+#   train_p, val_p = lists of filenames
+#   train_l, val_l = lists of label indices
+
+def make_ds(paths, lbls, shuffle=False, repeat=False):
+    onehot = tf.keras.utils.to_categorical(lbls, num_classes)
+    ds = tf.data.Dataset.from_tensor_slices((paths, onehot))
+    if shuffle:
+        ds = ds.shuffle(buffer_size=len(paths), reshuffle_each_iteration=True)
+
+    ds = ds.map(load_and_process, num_parallel_calls=tf.data.AUTOTUNE)
+
+    ds = ds.padded_batch(
+        BATCH_SIZE,
+        padded_shapes=(
+            [None, N_LOG_BINS],    # spec
+            [None, num_classes],   # frame_labels
+            [None]                 # weights
+        ),
+        padding_values=(
+            0.0,  # pad spec
+            0.0,  # pad labels
+            0.0   # pad weights (0 = ignored)
+        )
+    )
+    if repeat:
+        ds = ds.repeat()
+    return ds.prefetch(tf.data.AUTOTUNE)
+
+
+# usage
+train_ds = make_ds(train_p, train_l, shuffle=True,  repeat=True)
+val_ds   = make_ds(val_p,   val_l, shuffle=False, repeat=True)
+
+
+
+train_ds = make_ds(train_p, train_l, shuffle=True,  repeat=True)
+val_ds   = make_ds(val_p,   val_l, shuffle=False, repeat=True)
+
+
+train_ds = make_ds(train_p, train_l, shuffle=True,  repeat=True)
+
+# 1) See one batch
+# Sanity‑check one training batch
+# Sanity‑check one training batch
+for spec_batch, frame_labels_batch, weights_batch in train_ds.take(1):
+    # spec_batch  : (batch_size, time, bins)
+    # frame_labels_batch : (batch_size, time, classes)
+    # weights_batch : (batch_size, time)
+    print("Spectrogram batch shape   :", spec_batch.shape)
+    print("Frame‑labels batch shape  :", frame_labels_batch.shape)
+    print("Weights batch shape       :", weights_batch.shape)
+
+    # Show the first frame’s label for each sample
+    for i in range(spec_batch.shape[0]):
+        onehot  = frame_labels_batch[i, 0].numpy()
+        decoded = idx_to_label[int(np.argmax(onehot))]
+        print(f" Sample {i} first‑frame label → {decoded} (one‑hot {onehot})")
+    break
+
+
+
+
+val_ds = make_ds(val_p, val_l, shuffle=False, repeat=True)
+validation_steps = max(1, len(val_p) // BATCH_SIZE)
+
+
+steps_per_epoch  = math.ceil(len(train_p)/BATCH_SIZE)
+validation_steps = max(1, math.ceil(len(val_p)/BATCH_SIZE))
 
 ###################################
-# 4. Train / Test Split
+# 4. Model – CNN (no pooling) + 2‑layer GRU
 ###################################
-indices = np.arange(num_samples)
-np.random.shuffle(indices)
-split_idx = int(num_samples * (1 - TEST_SPLIT))
+inp = Input(shape=(None, N_LOG_BINS), name="spec_input")   # (batch, time, bins)
 
-train_idx = indices[:split_idx]
-test_idx = indices[split_idx:]
+# ---- two GRU layers, both returning sequences ----
+x   = GRU(RNN_UNITS, return_sequences=True, name="gru1")(inp)
+x   = GRU(RNN_UNITS, return_sequences=True, name="gru2")(x)
 
-X_train = X_data[train_idx]
-y_train = y_data[train_idx]
-X_test = X_data[test_idx]
-y_test = y_data[test_idx]
+# ---- per‑frame dense + sigmoid (multilabel) ----
+x   = TimeDistributed(Dense(64, activation="relu"), name="td_dense1")(x)
+out = TimeDistributed(Dense(num_classes, activation="sigmoid"), name="td_output")(x)
 
-print(f"Training samples: {len(X_train)}")
-print(f"Testing samples: {len(X_test)}")
-
-###################################
-# 5. Build the Model (No Pooling, With Dropout)
-###################################
-freq_bins = N_LOG_BINS
-time_dim = max_time_frames
-
-inputs = layers.Input(shape=(freq_bins, time_dim, 1))
-
-# ---- Convolutional layers, NO POOLING, but with dropout ----
-x = layers.Conv2D(16, (3,3), activation='relu', padding='same')(inputs)
-x = layers.Dropout(DROPOUT_RATE)(x)
-
-x = layers.Conv2D(32, (3,3), activation='relu', padding='same')(x)
-x = layers.Dropout(DROPOUT_RATE)(x)
-# shape: (None, freq_bins, time_dim, 32)
-
-# ---- Now reshape for RNN ----
-shape_after_cnn = tf.keras.backend.int_shape(x)
-_, freq_post, time_post, chan_post = shape_after_cnn
-feat_dim = freq_post * chan_post  # combine freq and channels
-
-# We assume each time frame is the second dimension we want for RNN
-# so we permute: (batch, freq, time, chan) -> (batch, time, freq, chan)
-x = layers.Permute((2,1,3))(x)  # (None, time_dim, freq_bins, 32)
-x = layers.Reshape((time_post, feat_dim))(x)  # (None, time_dim, freq_bins*32)
-
-# ---- RNN layer with dropout ----
-x = layers.GRU(RNN_UNITS, return_sequences=False)(x)
-x = layers.Dropout(DROPOUT_RATE)(x)
-
-# ---- Dense -> Sigmoid for multi-label ----
-x = layers.Dense(64, activation='relu')(x)
-outputs = layers.Dense(num_classes, activation='sigmoid')(x)
-
-model = models.Model(inputs, outputs)
+model = Model(inputs=inp, outputs=out, name="seq_crnn")
 model.compile(
     optimizer=tf.keras.optimizers.Adam(learning_rate=LEARNING_RATE),
-    loss='binary_crossentropy',
-    metrics=['accuracy']
+    loss="binary_crossentropy",
+    metrics=["accuracy"]
 )
 
 model.summary()
 
 ###################################
-# 6. Training
+# 5. Train
 ###################################
-history = model.fit(
-    X_train, y_train,
-    validation_split=0.2,
-    epochs=EPOCHS,
-    batch_size=BATCH_SIZE
+model.fit(
+    train_ds,
+    validation_data=val_ds,
+    steps_per_epoch=steps_per_epoch,
+    validation_steps=validation_steps,
+    epochs=EPOCHS
 )
 
+
 ###################################
-# 7. Evaluation
+# 6. Evaluate on validation set
 ###################################
-test_loss, test_acc = model.evaluate(X_test, y_test, verbose=0)
-print(f"Test loss: {test_loss:.4f}")
-print(f"Test accuracy: {test_acc:.4f}")
+
+loss, acc = model.evaluate(val_ds, steps=validation_steps)
+print(f"Val loss: {loss:.4f} | Val acc: {acc:.4f}")
+
+###################################
+# 7. Prediction report
+###################################
+def load_with_name(fname, label_vec):
+    # we only need the spectrogram + the original clip‑level one‑hot label + filename
+    spec, frame_labels, weights = load_and_process(fname, label_vec)
+    return spec, label_vec, fname
 
 
-import numpy as np
-import pandas as pd
+pred_ds = (
+    tf.data.Dataset
+      .from_tensor_slices((val_p, tf.keras.utils.to_categorical(val_l, num_classes)))
+      .map(load_with_name, num_parallel_calls=tf.data.AUTOTUNE)
+      .padded_batch(
+          BATCH_SIZE,
+          padded_shapes=(
+            [None, N_LOG_BINS],   # spec: (time, bins)
+            [num_classes],        # label: (classes,)
+            []                    # fname: scalar
+          )
+      )
+      .prefetch(tf.data.AUTOTUNE)
+)
 
-# -----------------------------------------------
-#  AFTER  model.evaluate(...) add this block
-# -----------------------------------------------
 
-# threshold for sigmoid → binary
 THR = 0.35
-
-# 1) run inference on the test set
-y_prob = model.predict(X_test, batch_size=8)
-
-label_to_idx = {'5_0': 0, '6_0': 1, '6_5': 2, 'silence': 3}
-
-# --- inspect predictions before thresholding ---
-print("\nF U L L   P R E D I C T I O N   R E P O R T")
-print("===========================================\n")
-
-for i, (true_vec, prob_vec) in enumerate(zip(y_test, y_prob)):
-    test_sample_idx = test_idx[i]
-    filename = df.iloc[test_sample_idx]['filename']
-
-    idx_to_label = {i: label for label, i in label_to_idx.items()}
-
-    true_labels = [idx_to_label[j] for j in np.where(true_vec == 1)[0]]
-
-    # Predicted label(s)
-    pred_vec = (prob_vec >= THR).astype(int)
-    pred_labels = [idx_to_label[j] for j in np.where(pred_vec == 1)[0]]
-
-    # Format probability output
-    prob_rounded = {idx_to_label[j]: float(f"{prob_vec[j]:.3f}") for j in range(len(prob_vec))}
-
-    # Display all results
-    print(f"{filename:20s} | TRUE: {', '.join(true_labels):<12} → PRED: {', '.join(pred_labels)}")
-    print(f"  Probs: {prob_rounded}\n")
-
-
-# Always predict the class with the highest probability
-y_pred = np.zeros_like(y_prob)
-top1 = np.argmax(y_prob, axis=1)
-y_pred[np.arange(len(y_prob)), top1] = 1
-
-
-# 2) utility: map index ↔ label
-idx_to_label = {i: lbl for lbl, i in label_to_idx.items()}
-
-# 3) list to collect misses
+print("\nF U L L   P R E D I C T I O N   R E P O R T\n" + "=" * 43)
 miss_rows = []
 
-print("\nM I S S  C A S E S")
-print("--------------------")
-for i, (true_vec, pred_vec) in enumerate(zip(y_test, y_pred)):
-    if not np.array_equal(true_vec, pred_vec):
-        # retrieve filename of this sample
-        test_sample_idx = test_idx[i]      # original row in full dataset
-        wav_file = df.iloc[test_sample_idx]["filename"]
+for specs, labels, fnames in pred_ds:
+    seq_probs = model.predict(specs, verbose=0)      # -> (batch, time, classes)
+    for j in range(seq_probs.shape[0]):
+        fn          = fnames[j].numpy().decode()
+        true_vec    = labels[j].numpy()               # (classes,)
+        per_frame   = seq_probs[j]                    # (time, classes)
+        clip_prob   = per_frame.mean(axis=0)          # now (classes,)
 
-        # decode the multi‑hot vectors to label lists
-        true_labels = [idx_to_label[j] for j in np.where(true_vec == 1)[0]]
-        pred_labels = [idx_to_label[j] for j in np.where(pred_vec == 1)[0]]
+        # threshold‑or‑fallback
+        pred_vecs = (clip_prob >= THR).astype(int)
+        if not pred_vecs.any():
+            top1 = clip_prob.argmax()
+            pred_vecs[top1] = 1
 
-        print(f"{wav_file:20s} | true: {true_labels}  →  pred: {pred_labels}")
+        # decode labels
+        true_lbls = [idx_to_label[k] for k in np.where(true_vec==1)[0]]
+        pred_lbls = [idx_to_label[k] for k in np.where(pred_vecs==1)[0]]
 
-        miss_rows.append({
-            "filename": wav_file,
-            "true_labels": ";".join(true_labels),
-            "pred_labels": ";".join(pred_labels)
-        })
+        # format probs
+        prob_str = ", ".join(
+            f"{idx_to_label[k]}:{clip_prob[k]:.2f}"
+            for k in range(len(clip_prob))
+        )
 
-print(f"\nTotal mis‑classified clips: {len(miss_rows)} / {len(X_test)}")
+        print(f"{fn:<25s} | TRUE: {', '.join(true_lbls):<15} → PRED: {', '.join(pred_lbls)}")
+        print(f"  Probs: {prob_str}")
 
-# 4) save to CSV (optional)
+        # count misses by top‑1
+        top1_pred = clip_prob.argmax()
+        if np.argmax(true_vec) != top1_pred:
+            miss_rows.append({
+                "filename": fn,
+                "true_labels": ";".join(true_lbls),
+                "pred_labels": idx_to_label[top1_pred]
+            })
+
+print(f"\nTotal mis‑classified clips: {len(miss_rows)} / {len(val_p)}")
 if miss_rows:
     pd.DataFrame(miss_rows).to_csv("misclassified_clips.csv", index=False)
     print("Saved details to misclassified_clips.csv")
+
+
+###################################
+# 8. Predict on a single file
+###################################
+AUDIO_FILE = "First_test (1).wav"  # path to your audio file
+
+def compute_log_spectrogram_test(y, sr):
+    S = np.abs(librosa.stft(y, n_fft=FFT_SIZE, hop_length=HOP_LENGTH))
+    S_db = librosa.amplitude_to_db(S, ref=np.max)
+    freqs = librosa.fft_frequencies(sr=sr, n_fft=FFT_SIZE)
+    log_bins = np.logspace(np.log10(MIN_FREQ), np.log10(MAX_FREQ), N_LOG_BINS)
+    out = np.zeros((S_db.shape[1], N_LOG_BINS), dtype=np.float32)
+    for k, f in enumerate(log_bins):
+        idx = np.argmin(np.abs(freqs - f))
+        out[:, k] = S_db[idx]
+    out = (out - out.mean(axis=1, keepdims=True)) / (out.std(axis=1, keepdims=True) + 1e-6)
+    return out
+
+# ----------------------------
+# Step 1: Load and preprocess audio
+# ----------------------------
+y, sr = sf.read(AUDIO_FILE)
+if y.ndim == 2:  # stereo → mono
+    y = y[:, 0] if np.sum(np.abs(y[:, 0])) > np.sum(np.abs(y[:, 1])) else y[:, 1]
+
+spec = compute_log_spectrogram_test(y, sr)  # shape: (T, bins)
+spec = np.expand_dims(spec, axis=0)    # add batch dim: (1, T, bins)
+
+
+preds = model.predict(spec, verbose=0)[0]  # shape: (T, num_classes)
+
+# ----------------------------
+# Step 3: Aggregate predictions (clip-level)
+# ----------------------------
+predicted_seq = []
+
+# For each frame, find the top predicted class (if above threshold)
+for frame in preds:
+    if frame.max() < THR:
+        predicted_seq.append("silence")
+    else:
+        predicted_seq.append(idx_to_label[frame.argmax()])
+
+# Collapse consecutive duplicates
+ordered_labels = []
+prev_label = None
+for label in predicted_seq:
+    if label != prev_label:
+        ordered_labels.append(label)
+        prev_label = label
+
+# Remove silence from result (optional)
+ordered_notes = [lbl for lbl in ordered_labels if lbl != "silence"]
+
+print(f"Predicted Note Sequence: {ordered_notes}")
+
+# Decode final predicted classes
+
+# Optional: Frame-wise plot
+plt.imshow(preds.T, aspect='auto', origin='lower', cmap='magma')
+plt.colorbar()
+plt.yticks(np.arange(len(idx_to_label)), [idx_to_label[i] for i in range(len(idx_to_label))])
+plt.title("Per-frame Prediction Probabilities")
+plt.xlabel("Time Frame")
+plt.ylabel("Label")
+plt.tight_layout()
+plt.show()
