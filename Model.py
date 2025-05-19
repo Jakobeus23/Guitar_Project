@@ -10,6 +10,8 @@ from tensorflow.keras import layers, models
 from tensorflow.keras.layers import Input, Masking, GRU, TimeDistributed, Dense
 from tensorflow.keras.models import Model
 from matplotlib import pyplot as plt
+print(tf.__version__)
+print(tf.sysconfig.get_build_info()["cuda_version"])
 
 os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'  # FOR out_of_range error default w/ batches || 0 = all logs, 1 = warnings, 2 = errors only, 3 = fatal errors
 
@@ -28,10 +30,10 @@ N_LOG_BINS = 512
 
 TEST_SPLIT = 0.2
 BATCH_SIZE = 8
-EPOCHS      = 35
+EPOCHS      = 5
 RNN_UNITS   = 64
-LEARNING_RATE = 1e-3
-DROPOUT     = 0.1
+LEARNING_RATE = 5e-4
+DROPOUT     = 0.2
 
 ###################################
 # 1. Read label file
@@ -115,7 +117,7 @@ labels_idx = df["label"].map(label_to_idx).tolist()
 train_p, val_p, train_l, val_l = train_test_split(paths, labels_idx, test_size=TEST_SPLIT,
                                                  stratify=labels_idx, random_state=42)
 
-# assume you’ve already split:
+# assume already split:
 #   train_p, val_p = lists of filenames
 #   train_l, val_l = lists of label indices
 
@@ -300,7 +302,7 @@ if miss_rows:
 ###################################
 # 8. Predict on a single file
 ###################################
-AUDIO_FILE = "First_test (1).wav"  # path to your audio file
+AUDIO_FILE = "Final_test (1).wav"  # path to your audio file
 
 def compute_log_spectrogram_test(y, sr):
     S = np.abs(librosa.stft(y, n_fft=FFT_SIZE, hop_length=HOP_LENGTH))
@@ -313,6 +315,30 @@ def compute_log_spectrogram_test(y, sr):
         out[:, k] = S_db[idx]
     out = (out - out.mean(axis=1, keepdims=True)) / (out.std(axis=1, keepdims=True) + 1e-6)
     return out
+
+def sequence_to_tab(note_sequence, spacing):
+    # Standard tab string names: top to bottom
+    string_names = ["e", "B", "G", "D", "A", "E"]  # string 1 to 6
+    tab_lines = {s: [] for s in string_names}     # Each string's output line
+
+    for note in note_sequence:
+        line_chars = ["-" * (spacing + 1) for _ in string_names]  # Default spacing
+        if "_" in note:
+            string_num, fret = note.split("_")
+            string_idx = int(string_num) - 1  # 6 → index 5 (E), 1 → index 0 (e)
+            fret_str = str(fret) + "-" * spacing
+            if 0 <= string_idx < 6:
+                string_name = string_names[5 - string_idx]  # 6 → 'E', 1 → 'e'
+                line_chars[string_names.index(string_name)] = fret_str
+        for s, ch in zip(string_names, line_chars):
+            tab_lines[s].append(ch)
+
+    # Join each line into string
+    tab_output = "\n".join(f"{s}|{''.join(tab_lines[s])}" for s in string_names)
+    return tab_output
+
+
+
 
 # ----------------------------
 # Step 1: Load and preprocess audio
@@ -347,14 +373,16 @@ for label in predicted_seq:
         ordered_labels.append(label)
         prev_label = label
 
-# Remove silence from result (optional)
+# Remove silence from result
 ordered_notes = [lbl for lbl in ordered_labels if lbl != "silence"]
 
-print(f"Predicted Note Sequence: {ordered_notes}")
+print(sequence_to_tab(ordered_notes, 1))
 
-# Decode final predicted classes
 
-# Optional: Frame-wise plot
+# Decode final predicted classes into tabs
+
+
+#  Frame-wise plot
 plt.imshow(preds.T, aspect='auto', origin='lower', cmap='magma')
 plt.colorbar()
 plt.yticks(np.arange(len(idx_to_label)), [idx_to_label[i] for i in range(len(idx_to_label))])
